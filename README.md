@@ -45,4 +45,4 @@ quarto render household_power_analysis.qmd
 
 ## Author
 
-Uthman B. Adedeji
+Abdulbasit A. Adedeji (Data Ustadh)
