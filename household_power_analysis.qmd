@@ -1,0 +1,420 @@
+---
+title: "Household power consumption analysis and forecasting"
+---
+
+::: {.callout-note}
+This report was generated using AI under general human direction. At the time of generation, the contents have not been comprehensively reviewed by a human analyst.
+
+<!--
+To indicate human review: Delete the line above about contents not being reviewed, and replace this comment with:
+The contents have been reviewed and validated by [Your Name], [Your Role] on [Date].
+-->
+:::
+
+# Introduction
+
+This report analyzes the UCI Individual Household Electric Power Consumption dataset, which contains minute-level electrical measurements from a single household located in Sceaux, near Paris, France, collected between December 2006 and November 2010. The analysis covers data cleaning, seasonal consumption patterns, sub-metering circuit breakdown, and time-series forecasting using both classical statistical methods and machine learning.
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(zoo)
+library(forecast)
+library(ranger)
+library(jsonlite)
+```
+
+```{r}
+#| label: load-data
+#| message: false
+df <- fread(
+  "household_power_consumption.txt",
+  sep = ";",
+  na.strings = "?"
+)
+
+df[, DateTime := dmy_hms(paste(Date, Time))]
+df[, Date := dmy(Date)]
+```
+
+The dataset contains `{r} format(nrow(df), big.mark = ",")` minute-level observations across `{r} ncol(df) - 1` measurement variables plus a derived `DateTime` column.
+
+# Data cleaning
+
+## Missing data assessment
+
+```{r}
+#| label: missing-data-overview
+colSums(is.na(df[, .(Global_active_power, Global_reactive_power, Voltage,
+                      Global_intensity, Sub_metering_1, Sub_metering_2, Sub_metering_3)]))
+```
+
+All seven numeric measurement columns share exactly the same count of missing values, suggesting full-row outages. We can confirm this:
+
+```{r}
+#| label: confirm-full-row-missingness
+numeric_cols <- c("Global_active_power", "Global_reactive_power", "Voltage",
+                   "Global_intensity", "Sub_metering_1", "Sub_metering_2", "Sub_metering_3")
+na_per_row <- rowSums(is.na(df[, ..numeric_cols]))
+table(na_per_row)
+```
+
+Every row is either fully complete (0 columns missing) or entirely missing across all 7 numeric columns — there is no partial-row missingness.
+
+## Gap analysis and imputation strategy
+
+```{r}
+#| label: gap-analysis
+df[, is_na := na_per_row == 7]
+setorder(df, DateTime)
+df[, run_id := rleid(is_na)]
+
+gap_lengths <- df[is_na == TRUE, .N, by = run_id]$N
+
+gap_summary <- data.frame(
+  gap_length = c("1 min", "2-5 min", "6-60 min", "1-3 hr", "3-24 hr", ">1 day"),
+  n_gaps = as.integer(table(cut(gap_lengths,
+    breaks = c(0, 1, 5, 60, 180, 1440, Inf),
+    labels = c("1 min", "2-5 min", "6-60 min", "1-3 hr", "3-24 hr", ">1 day")))),
+  total_missing_minutes = sapply(split(gap_lengths,
+    cut(gap_lengths, breaks = c(0, 1, 5, 60, 180, 1440, Inf))), sum)
+)
+gap_summary
+```
+
+The `{r} length(gap_lengths)` contiguous gaps range from a single minute to nearly 5 days. Short-to-medium gaps (≤1 day) were imputed via linear interpolation (`zoo::na.approx` with `maxgap = 1440`), while multi-day gaps were dropped entirely — linear interpolation across multiple days would fabricate unrealistic flat trends across real daily consumption cycles.
+
+```{r}
+#| label: impute-and-drop
+for (col in numeric_cols) {
+  df[[col]] <- na.approx(df[[col]], maxgap = 1440, na.rm = FALSE)
+}
+
+df <- df[!is.na(Global_active_power)]
+df[, c("is_na", "run_id") := NULL]
+```
+
+After cleaning, the dataset has `{r} format(nrow(df), big.mark = ",")` rows with no remaining missing values.
+
+# Seasonal consumption patterns
+
+```{r}
+#| label: daily-aggregation
+daily <- df[, .(mean_power = mean(Global_active_power)), by = .(date = Date)]
+daily[, `:=`(
+  month = month(date),
+  year = year(date),
+  month_label = month(date, label = TRUE)
+)]
+```
+
+```{r}
+#| label: daily-trend-plot
+ggplot(daily, aes(x = date, y = mean_power)) +
+  geom_line(linewidth = 0.3, alpha = 0.4, color = "grey40") +
+  geom_smooth(method = "loess", se = FALSE, span = 0.15, linewidth = 0.8, color = "steelblue") +
+  labs(x = "Date", y = "Mean Global Active Power (kW)",
+       title = "Daily mean power consumption with LOESS trend") +
+  theme_minimal()
+```
+
+```{r}
+#| label: monthly-boxplot
+ggplot(daily, aes(x = month_label, y = mean_power)) +
+  geom_boxplot() +
+  labs(x = "Month", y = "Mean Daily Power (kW)",
+       title = "Seasonal pattern in power consumption") +
+  theme_minimal()
+```
+
+Consumption follows a repeating annual cycle: higher in winter months (November–February, median ~1.3–1.5 kW) and lower in summer (July–August, median ~0.6–0.7 kW), consistent with heating-driven demand in a temperate European climate.
+
+# Sub-metering and unmetered consumption
+
+The dataset includes three sub-metering circuits:
+
+- **Sub_metering_1**: Kitchen (dishwasher, oven, microwave)
+- **Sub_metering_2**: Laundry (washing machine, tumble dryer, refrigerator, light)
+- **Sub_metering_3**: Electric water heater and air conditioner
+
+```{r}
+#| label: unmetered-calculation
+df[, unmetered := (Global_active_power * 1000 / 60) -
+     (Sub_metering_1 + Sub_metering_2 + Sub_metering_3)]
+```
+
+```{r}
+#| label: component-means
+daily_components <- df[, .(
+  Sub_metering_1 = mean(Sub_metering_1),
+  Sub_metering_2 = mean(Sub_metering_2),
+  Sub_metering_3 = mean(Sub_metering_3),
+  Unmetered      = mean(unmetered)
+), by = .(date = Date)]
+
+daily_components[, lapply(.SD, function(x) round(mean(x), 2)),
+  .SDcols = c("Sub_metering_1", "Sub_metering_2", "Sub_metering_3", "Unmetered")]
+```
+
+The unmetered portion of consumption (9.3 Wh/min on average) is the single largest component, exceeding Sub_metering_3 (6.4 Wh/min). Sub_metering_1 and Sub_metering_2 are relatively small (~1 Wh/min each).
+
+```{r}
+#| label: component-seasonal-plot
+comp_long <- melt(daily_components, id.vars = "date",
+                   variable.name = "component", value.name = "mean_wh")
+comp_long[, month_label := month(date, label = TRUE)]
+
+ggplot(comp_long, aes(x = month_label, y = mean_wh)) +
+  geom_boxplot() +
+  facet_wrap(~component, scales = "free_y") +
+  labs(x = "Month", y = "Mean Daily Consumption (Wh/min)",
+       title = "Seasonal patterns: metered circuits vs. unmetered consumption") +
+  theme_minimal()
+```
+
+All four components show winter-high/summer-low seasonality, but the unmetered consumption and Sub_metering_3 exhibit the widest seasonal swings.
+
+# Hourly consumption profiles
+
+```{r}
+#| label: hourly-profiles
+df[, `:=`(
+  hour = hour(DateTime),
+  season = fcase(
+    month(Date) %in% c(12, 1, 2), "Winter",
+    month(Date) %in% c(3, 4, 5), "Spring",
+    month(Date) %in% c(6, 7, 8), "Summer",
+    month(Date) %in% c(9, 10, 11), "Autumn"
+  )
+)]
+df[, season := factor(season, levels = c("Winter", "Spring", "Summer", "Autumn"))]
+
+hourly_profile <- df[, .(mean_power = mean(Global_active_power)), by = .(hour, season)]
+```
+
+```{r}
+#| label: hourly-profile-plot
+ggplot(hourly_profile, aes(x = hour, y = mean_power, color = season)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  scale_x_continuous(breaks = seq(0, 23, 2)) +
+  labs(x = "Hour of Day", y = "Mean Global Active Power (kW)",
+       title = "Hourly consumption profile by season",
+       color = "Season") +
+  theme_minimal()
+```
+
+Consumption follows a double-peaked daily pattern: a morning rise around 7:00 (~1.5 kW overall) and an evening peak around 20:00–21:00 (~1.9 kW overall), with a trough at 4:00–5:00 (~0.4 kW). Winter evenings are the highest-demand period (~2.5 kW at 20:00), while summer consumption stays relatively flat and low throughout the day.
+
+# Time-series forecasting
+
+## Daily forecasting
+
+```{r}
+#| label: daily-forecast-setup
+setorder(daily, date)
+n <- nrow(daily)
+
+ts_power <- ts(daily$mean_power, frequency = 365, start = c(2006, 350))
+train_ts <- window(ts_power, end = time(ts_power)[n - 30])
+test_ts <- window(ts_power, start = time(ts_power)[n - 29])
+```
+
+Three models were compared on a 30-day held-out test set:
+
+```{r}
+#| label: daily-stl-ets
+fit_stl <- stlf(train_ts, h = 30, method = "ets")
+acc_stl <- accuracy(fit_stl, test_ts)
+```
+
+```{r}
+#| label: daily-arima
+fit_arima <- auto.arima(train_ts)
+fc_arima <- forecast(fit_arima, h = 30)
+acc_arima <- accuracy(fc_arima, test_ts)
+```
+
+```{r}
+#| label: daily-arima-xreg
+make_xreg <- function(dates) {
+  dow <- model.matrix(~ factor(wday(dates)) - 1)[, -1]
+  mon <- model.matrix(~ factor(month(dates)) - 1)[, -1]
+  colnames(dow) <- paste0("dow_", 2:7)
+  colnames(mon) <- paste0("mon_", 2:12)
+  cbind(dow, mon)
+}
+
+xreg_train <- make_xreg(daily$date[1:(n - 30)])
+xreg_test <- make_xreg(daily$date[(n - 29):n])
+fit_xreg <- auto.arima(daily$mean_power[1:(n - 30)], xreg = xreg_train)
+fc_xreg <- forecast(fit_xreg, xreg = xreg_test, h = 30)
+acc_xreg <- accuracy(fc_xreg, daily$mean_power[(n - 29):n])
+```
+
+```{r}
+#| label: daily-model-comparison
+data.frame(
+  Model = c("STL + ETS", "ARIMA", "ARIMA + xreg"),
+  RMSE = round(c(acc_stl["Test set", "RMSE"], acc_arima["Test set", "RMSE"], acc_xreg["Test set", "RMSE"]), 3),
+  MAE = round(c(acc_stl["Test set", "MAE"], acc_arima["Test set", "MAE"], acc_xreg["Test set", "MAE"]), 3),
+  MAPE = round(c(acc_stl["Test set", "MAPE"], acc_arima["Test set", "MAPE"], acc_xreg["Test set", "MAPE"]), 1)
+)
+```
+
+The plain ARIMA model performed best on the daily test set. Adding day-of-week and month regressors did not meaningfully improve performance, as the ARIMA terms already capture relevant autocorrelation structure.
+
+## Hourly forecasting with ARIMA + Fourier
+
+```{r}
+#| label: hourly-aggregation
+df[, datetime_hour := floor_date(DateTime, "hour")]
+hourly <- df[, .(mean_power = mean(Global_active_power)), by = .(datetime_hour)]
+setorder(hourly, datetime_hour)
+
+n_h <- nrow(hourly)
+h_test <- 48
+
+hourly_msts <- msts(hourly$mean_power, seasonal.periods = c(24, 24 * 7))
+train_h <- head(hourly_msts, n_h - h_test)
+test_h <- tail(hourly$mean_power, h_test)
+
+fourier_train <- fourier(train_h, K = c(10, 5))
+fourier_test <- fourier(train_h, K = c(10, 5), h = h_test)
+```
+
+```{r}
+#| label: hourly-arima-fourier
+fit_hourly <- Arima(train_h, order = c(2, 1, 2), xreg = fourier_train)
+fc_hourly <- forecast(fit_hourly, xreg = fourier_test, h = h_test)
+acc_hourly <- accuracy(fc_hourly, test_h)
+```
+
+# Machine learning forecast
+
+A random forest model was trained on the hourly data with engineered features including time-of-day, day-of-week, month (both as integers and cyclical sine/cosine encodings), lag features (1-hour, 24-hour, and 168-hour lags), rolling means (24-hour and 168-hour windows), and outdoor temperature from the Open-Meteo historical weather API.
+
+```{r}
+#| label: ml-feature-engineering
+hourly_ml <- copy(hourly)
+hourly_ml[, `:=`(
+  hour = hour(datetime_hour),
+  dow  = wday(datetime_hour),
+  month = month(datetime_hour),
+  year = year(datetime_hour),
+  hour_sin = sin(2 * pi * hour(datetime_hour) / 24),
+  hour_cos = cos(2 * pi * hour(datetime_hour) / 24),
+  dow_sin  = sin(2 * pi * wday(datetime_hour) / 7),
+  dow_cos  = cos(2 * pi * wday(datetime_hour) / 7),
+  month_sin = sin(2 * pi * month(datetime_hour) / 12),
+  month_cos = cos(2 * pi * month(datetime_hour) / 12),
+  lag_1h   = shift(mean_power, 1),
+  lag_24h  = shift(mean_power, 24),
+  lag_168h = shift(mean_power, 168),
+  roll_24h  = frollmean(mean_power, 24, align = "right"),
+  roll_168h = frollmean(mean_power, 168, align = "right")
+)]
+```
+
+```{r}
+#| label: fetch-weather
+weather_url <- "https://archive-api.open-meteo.com/v1/archive?latitude=48.78&longitude=2.29&start_date=2006-12-16&end_date=2010-11-27&hourly=temperature_2m&timezone=UTC"
+weather_json <- fromJSON(weather_url)
+weather_dt <- data.table(
+  datetime_hour = as.POSIXct(weather_json$hourly$time, format = "%Y-%m-%dT%H:%M", tz = "UTC"),
+  temp_c = weather_json$hourly$temperature_2m
+)
+hourly_ml <- merge(hourly_ml, weather_dt, by = "datetime_hour", all.x = TRUE)
+hourly_ml <- hourly_ml[complete.cases(hourly_ml)]
+```
+
+```{r}
+#| label: ml-train-test-split
+n_ml <- nrow(hourly_ml)
+train_ml <- hourly_ml[1:(n_ml - 48), ]
+test_ml <- hourly_ml[(n_ml - 47):n_ml, ]
+
+features <- c("hour", "dow", "month", "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+              "month_sin", "month_cos", "lag_1h", "lag_24h", "lag_168h",
+              "roll_24h", "roll_168h", "temp_c")
+```
+
+```{r}
+#| label: fit-random-forests
+set.seed(4821)
+
+rf_with_weather <- ranger(
+  mean_power ~ .,
+  data = train_ml[, c("mean_power", features), with = FALSE],
+  num.trees = 500, mtry = 5, importance = "impurity"
+)
+
+rf_no_weather <- ranger(
+  mean_power ~ .,
+  data = train_ml[, c("mean_power", setdiff(features, "temp_c")), with = FALSE],
+  num.trees = 500, mtry = 5, importance = "impurity"
+)
+
+pred_with <- predict(rf_with_weather, data = test_ml[, features, with = FALSE])$predictions
+pred_without <- predict(rf_no_weather, data = test_ml[, setdiff(features, "temp_c"), with = FALSE])$predictions
+```
+
+```{r}
+#| label: all-hourly-model-comparison
+data.frame(
+  Model = c("ARIMA(2,1,2) + Fourier", "Random Forest (no weather)", "Random Forest (with weather)"),
+  RMSE = round(c(
+    acc_hourly["Test set", "RMSE"],
+    sqrt(mean((pred_without - test_ml$mean_power)^2)),
+    sqrt(mean((pred_with - test_ml$mean_power)^2))
+  ), 3),
+  MAE = round(c(
+    acc_hourly["Test set", "MAE"],
+    mean(abs(pred_without - test_ml$mean_power)),
+    mean(abs(pred_with - test_ml$mean_power))
+  ), 3)
+)
+```
+
+The random forest roughly halves the ARIMA's error on the 48-hour test set. Adding outdoor temperature as a feature did not improve performance — lag features already implicitly encode the seasonal variation that temperature drives.
+
+```{r}
+#| label: feature-importance
+imp <- sort(rf_with_weather$variable.importance, decreasing = TRUE)
+data.frame(feature = names(imp), importance = round(imp, 1))
+```
+
+The 1-hour lag is by far the most important feature, contributing more importance than all other features combined. This reflects the strongly autoregressive nature of household power consumption — the best predictor of current usage is recent usage.
+
+```{r}
+#| label: forecast-comparison-plot
+rf_fc_df <- data.frame(
+  datetime = test_ml$datetime_hour,
+  actual = test_ml$mean_power,
+  rf = pred_without,
+  arima = as.numeric(fc_hourly$mean)
+)
+train_tail <- hourly_ml[(n_ml - 48 - 72 + 1):(n_ml - 48), .(datetime_hour, mean_power)]
+
+ggplot() +
+  geom_line(data = train_tail, aes(x = datetime_hour, y = mean_power), color = "grey40") +
+  geom_line(data = rf_fc_df, aes(x = datetime, y = actual), color = "red", linewidth = 0.7) +
+  geom_line(data = rf_fc_df, aes(x = datetime, y = rf), color = "steelblue", linewidth = 0.9) +
+  geom_line(data = rf_fc_df, aes(x = datetime, y = arima), color = "orange", linewidth = 0.7, linetype = "dashed") +
+  labs(x = "DateTime", y = "Mean Hourly Power (kW)",
+       title = "48-hour forecast comparison",
+       subtitle = "Red = actual, Blue = Random Forest, Orange dashed = ARIMA+Fourier, Grey = training tail") +
+  theme_minimal()
+```
+
+# Conclusions
+
+- **Seasonal patterns**: Household consumption follows a strong annual cycle driven by heating demand — winter consumption is roughly double summer consumption.
+- **Circuit breakdown**: The electric water heater/air conditioner circuit (Sub_metering_3) dominates metered consumption, but over half of total consumption is unmetered and follows the same seasonal pattern.
+- **Daily rhythm**: A consistent double-peaked daily profile (morning ~7:00, evening ~20:00–21:00) holds across all seasons, with winter evenings producing the highest demand (~2.5 kW mean).
+- **Forecasting**: At daily resolution, ARIMA(5,1,4) performed well (RMSE 0.248 kW, 30-day test). At hourly resolution, a random forest with lag features roughly halved the error of an ARIMA+Fourier approach (RMSE 0.36 vs 0.69 kW). Adding outdoor temperature as a predictor did not improve the ML model, as autoregressive lag features already capture the temperature-driven seasonal signal.
+- **Key limitation**: Hour-to-hour consumption spikes from appliance switching events remain inherently difficult to predict from time features alone.

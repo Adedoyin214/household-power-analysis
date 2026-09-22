@@ -1,0 +1,14 @@
+# Raw data (too large for GitHub — see README for download link)
+data/
+household_power_consumption.txt
+household_power_consumption.xlsx
+
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
+
+# Quarto render output
+/.quarto/
+*_files/
+household_power_analysis.html
